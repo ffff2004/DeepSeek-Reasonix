@@ -2,7 +2,9 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -2404,5 +2406,249 @@ func TestEffortCapabilityEmptySupportedEffortsNotConfigurable(t *testing.T) {
 	e2.SupportedEfforts = []string{}
 	if cap := EffortCapabilityForEntry(&e2); cap.Supported {
 		t.Fatalf("empty supported_efforts should also fall through to the heuristic, got %+v", cap)
+	}
+}
+
+func TestResolveConfigPathFollowsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.toml")
+	link := filepath.Join(dir, "link.toml")
+
+	// Create the target config file
+	if err := os.WriteFile(target, []byte("default_model = \"original\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Create a symlink pointing to it
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve target itself so the comparison is valid on platforms where
+	// t.TempDir() goes through a symlink (macOS: /var -> /private/var).
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// resolveConfigPath should follow the symlink
+	got := resolveConfigPath(link)
+	if got != resolvedTarget {
+		t.Errorf("resolveConfigPath(%q) = %q, want %q (follow symlink)", link, got, resolvedTarget)
+	}
+	// Non-symlink path should be returned unchanged
+	got2 := resolveConfigPath(target)
+	if got2 != target {
+		t.Errorf("resolveConfigPath(%q) = %q, want %q (no change)", target, got2, target)
+	}
+	// Non-existent path should be returned as-is
+	madeUp := filepath.Join(dir, "nonexistent.toml")
+	got3 := resolveConfigPath(madeUp)
+	if got3 != madeUp {
+		t.Errorf("resolveConfigPath(%q) = %q, want %q (fallback)", madeUp, got3, madeUp)
+	}
+
+	// Multi-level symlink chain should be fully resolved
+	link2 := filepath.Join(dir, "link2.toml")
+	if err := os.Symlink(link, link2); err != nil {
+		t.Fatal(err)
+	}
+	got4 := resolveConfigPath(link2)
+	if got4 != resolvedTarget {
+		t.Errorf("resolveConfigPath(%q) = %q, want %q (multi-level)", link2, got4, resolvedTarget)
+	}
+}
+
+func TestSaveToPreservesSymlinkToWritableTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.toml")
+	link := filepath.Join(dir, "link.toml")
+
+	// Create target file
+	if err := os.WriteFile(target, []byte("default_model = \"original\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Create symlink
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save config through the symlink
+	c := Default()
+	c.DefaultModel = "deepseek-pro"
+	if err := c.SaveTo(link); err != nil {
+		t.Fatalf("SaveTo through symlink: %v", err)
+	}
+
+	// Symlink must still be a symlink
+	linkStat, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkStat.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("SaveTo replaced the symlink with a regular file")
+	}
+
+	// Target file must contain the new config
+	var got Config
+	if _, err := toml.DecodeFile(target, &got); err != nil {
+		t.Fatalf("target file does not parse: %v", err)
+	}
+	if got.DefaultModel != "deepseek-pro" {
+		t.Errorf("target default_model = %q, want deepseek-pro", got.DefaultModel)
+	}
+}
+
+// makeDirReadOnly makes a directory non-writable in a platform-specific way.
+// On Unix it uses os.Chmod; on Windows it denies write permission via icacls.
+// The returned cleanup function restores write access.
+func makeDirReadOnly(dir string) (cleanup func(), err error) {
+	if runtime.GOOS == "windows" {
+		// Windows ACL: deny write for Everyone.
+		// icacls is available on all modern Windows SKUs.
+		if err := exec.Command("icacls", dir, "/deny", "Everyone:(W)").Run(); err != nil {
+			return nil, fmt.Errorf("icacls /deny: %w", err)
+		}
+		return func() {
+			// Remove the deny entry, restoring inherited permissions.
+			exec.Command("icacls", dir, "/remove:d", "Everyone").Run()
+		}, nil
+	}
+	orig, err := os.Stat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		return nil, err
+	}
+	return func() { os.Chmod(dir, orig.Mode().Perm()) }, nil
+}
+
+func TestSaveToFallbackWhenSymlinkTargetDirNotWritable(t *testing.T) {
+	dir := t.TempDir()
+	targetDir := filepath.Join(dir, "readonly")
+	target := filepath.Join(targetDir, "target.toml")
+	link := filepath.Join(dir, "link.toml")
+
+	// Create target dir and file
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("default_model = \"original\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Create symlink
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	// Make target directory read-only so AtomicWriteFile can't create tmp files
+	cleanup, err := makeDirReadOnly(targetDir)
+	if err != nil {
+		t.Fatalf("makeDirReadOnly: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	// Save config through the symlink — should fallback and replace the symlink
+	c := Default()
+	c.DefaultModel = "fallback-model"
+	if err := c.SaveTo(link); err != nil {
+		t.Fatalf("SaveTo through symlink with unwritable target: %v", err)
+	}
+
+	// Symlink should now be a regular file (fallback behaviour)
+	linkStat, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkStat.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("fallback did not replace the symlink")
+	}
+
+	// The file at the link path should contain the new config
+	var got Config
+	if _, err := toml.DecodeFile(link, &got); err != nil {
+		t.Fatalf("link file does not parse: %v", err)
+	}
+	if got.DefaultModel != "fallback-model" {
+		t.Errorf("link default_model = %q, want fallback-model", got.DefaultModel)
+	}
+}
+
+func TestSaveToBrokenSymlinkReplacesWithRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "broken-link.toml")
+
+	// Create a symlink pointing to nothing
+	if err := os.Symlink("/nonexistent/target.toml", link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save config through the broken symlink
+	c := Default()
+	c.DefaultModel = "deepseek-pro"
+	if err := c.SaveTo(link); err != nil {
+		t.Fatalf("SaveTo through broken symlink: %v", err)
+	}
+
+	// The broken symlink should be replaced with a regular file
+	linkStat, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkStat.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("broken symlink was not replaced with a regular file")
+	}
+
+	// The new regular file should contain the config
+	var got Config
+	if _, err := toml.DecodeFile(link, &got); err != nil {
+		t.Fatalf("file does not parse: %v", err)
+	}
+	if got.DefaultModel != "deepseek-pro" {
+		t.Errorf("default_model = %q, want deepseek-pro", got.DefaultModel)
+	}
+}
+
+func TestSaveToMultiLevelSymlinkChain(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.toml")
+	link1 := filepath.Join(dir, "link1.toml")
+	link2 := filepath.Join(dir, "link2.toml")
+
+	// Create target and a two-level symlink chain: link2 → link1 → target
+	if err := os.WriteFile(target, []byte("default_model = \"original\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(link1, link2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save through the two-level chain
+	c := Default()
+	c.DefaultModel = "deepseek-pro"
+	if err := c.SaveTo(link2); err != nil {
+		t.Fatalf("SaveTo through multi-level symlink: %v", err)
+	}
+
+	// Both links should still be symlinks
+	for name, ln := range map[string]string{"link1": link1, "link2": link2} {
+		stat, err := os.Lstat(ln)
+		if err != nil {
+			t.Fatalf("Lstat(%s): %v", name, err)
+		}
+		if stat.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("%s was replaced with a regular file", name)
+		}
+	}
+
+	// The final target should contain the new config
+	var got Config
+	if _, err := toml.DecodeFile(target, &got); err != nil {
+		t.Fatalf("target file does not parse: %v", err)
+	}
+	if got.DefaultModel != "deepseek-pro" {
+		t.Errorf("target default_model = %q, want deepseek-pro", got.DefaultModel)
 	}
 }
