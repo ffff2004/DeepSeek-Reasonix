@@ -2305,7 +2305,7 @@ func configReasoningLanguageCommand(args []string) int {
 
 func configUsage() {
 	fmt.Print(`Usage:
-  reasonix config reasoning-language [--local] [auto|zh|en]
+  reasonix config reasoning-language [--local] [auto|zh|en|off]
 `)
 }
 
@@ -2317,6 +2317,6 @@ func configAutoPlanCompatibilityUsage() {
 
 func configReasoningLanguageUsage() {
 	fmt.Print(`Usage:
-  reasonix config reasoning-language [--local] [auto|zh|en]
+  reasonix config reasoning-language [--local] [auto|zh|en|off]
 `)
 }

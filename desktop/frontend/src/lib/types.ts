@@ -1519,7 +1519,7 @@ export interface AgentView {
   maxParallelWriters: number;
   systemPrompt: string;
   coldResumePrune: boolean;
-  reasoningLanguage: string; // "auto" | "zh" | "en"
+  reasoningLanguage: string; // "auto" | "zh" | "en" | "off"
 }
 
 export interface BotAllowlistView {
