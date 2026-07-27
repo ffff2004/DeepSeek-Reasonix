@@ -81,3 +81,9 @@ replace reasonix => ../
 // Reasonix patches WebView2 monitor-scale detection for mixed-DPI restore
 // (#5862) and isolates its embedded/loopback UI from stale system proxies.
 replace github.com/wailsapp/go-webview2 => ./third_party/go-webview2
+
+// Local fork: fixes nativeStart() D-Bus timing (systrayReady after conn setup).
+replace fyne.io/systray => ../../systray
+
+// Local fork: fixes SetMinMaxSize not to force GDK_HINT_MAX_SIZE when unset.
+replace github.com/wailsapp/wails/v2 => ../../wails/v2
